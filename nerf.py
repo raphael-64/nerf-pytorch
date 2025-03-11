@@ -14,11 +14,12 @@ def positional_encoding(x, L):
         out.append(torch.cos(freq * np.pi * x))
     return torch.cat(out, dim=-1)
 
+
 class NeRF(nn.Module):
     def __init(self, D=8, W=256, L_pos=10, L_dir=4, skips=[4]):
         super(NeRF, self).__init__()
 
-        # frequency parameters for positional encoding
+        # frequency parameters for positional encoding function
         self.L_pos = L_pos
         self.L_dir = L_dir
 
@@ -42,28 +43,29 @@ class NeRF(nn.Module):
         self.views_linears = nn.ModuleList([nn.Linear(W+ self.in_ch_dir, W // 2)]) # concatenates feature vector and encoded viewing direction, reducing dim and applying ReLU
         self.rgb_linear = nn.Linear(W // 2, 3)# outputs 3 rgb values for each query point, sigmoid activation in forward ensures these are in 0,1 range
 
-        def forward(self, x, d):
-            x_encoded = positional_encoding(x, self.L_pos)
+    def forward(self, x, d):
+        x_encoded = positional_encoding(x, self.L_pos)
 
-            d_normalized = d / d.norm(dim=-1, keepdim=True)
-            d_encoded = positional_encoding(d_normalized, self.L_dir)
+        d_normalized = d / d.norm(dim=-1, keepdim=True)
+        d_encoded = positional_encoding(d_normalized, self.L_dir)
 
-            h = x_encoded
-            for i, layer in enumerate(self.pts_linears):
-                h = layer(h)
-                h = F.relu(h)
+        h = x_encoded
+        for i, layer in enumerate(self.pts_linears):
+            h = layer(h)
+            h = F.relu(h)
 
-                if i in skips:
-                    h = torch.cat([x_encoded, h], dim=-1)
-            
-            sigma = F.relu(self.sigma_linear(h))
-            for layer in self.view_linears:
-                h_color = layer(h_color)
-                h_color = F.relu(h_color)
+            if i in skips:
+                h = torch.cat([x_encoded, h], dim=-1)
+        
+        sigma = F.relu(self.sigma_linear(h))
 
-            rgb = torch.sigmod(self.rgb_linear(h_color))
-            output = torch.cat([rgb, sigma], dim=-1)
-            return output
+        for layer in self.view_linears:
+            h_color = layer(h_color)
+            h_color = F.relu(h_color)
+
+        rgb = torch.sigmod(self.rgb_linear(h_color))
+        output = torch.cat([rgb, sigma], dim=-1)
+        return output
         
             
 
@@ -72,17 +74,67 @@ def get_coarse_query_points(ray_o, ray_d, N_samples, t_n, t_f):
     N_rays = ray_o.shape[0]
 
     # sampling depths
-    t_vals = torch.linspace(0., 1., steps=N_samples, device=ray_o.device)
-    z_vals = t_n * (1. - t_vals) + t_f * t_vals
-    z_vals = z_vals.expand(N_rays, N_samples)
+    t_vals = torch.linspace(0., 1., steps=N_samples, device=ray_o.device) # evenly spaced tensor, but between 0 and 1
+    print(t_vals)
+    z_vals = t_n * (1. - t_vals) + t_f * t_vals # now between t_n and t_f, shape is (N_samples)
+    print(z_vals)
+    z_vals = z_vals.expand(N_rays, N_samples) 
+    print(z_vals)
 
     #stratified sampling
-    mids = 0.5 * (z_vals[:,1:] + z_vals[:, :-1]) # midpoints between adjacent samples
-    upper = torch.cat([mids, z_vals[:, :-1]], dim=-1) # upper bounds
-    lower = torch.cat([z_vals[:, :1], mids], dim=-1) # lower 
+    mids = 0.5 * (z_vals[:, 1:] + z_vals[:, :-1])
+    print(mids)
+    upper = torch.cat([mids, z_vals[:, -1:]], dim=-1)
+    lower = torch.cat([z_vals[:, :1], mids], dim=-1)
+    # lower = z_vals[:, :-1]  # left boundary of each interval
+    print(lower)
+    # upper = z_vals[:, 1:]   # Right boundary
+    print(upper)
     t_rand = torch.rand(z_vals.shape, device = ray_o.device) # random numbers so u can sample within the bins
+    print(t_rand)
     z_vals = lower + (upper-lower) * t_rand # sample within each bin using t_Rand
+    print(z_vals)
 
-    r_ts = ray_o.unsqueeze(1) + ray_d.unsqueeze(1) * z_vals.unsqueeze(2) # calc using r = o + td formula
+    r_ts = ray_o[:, None, :] + ray_d[:, None, :] * z_vals[..., None] # calc using r = o + td formula
+    print(r_ts)
+
+
+    print("ight so final returns are")
+    print(r_ts)
+    print(z_vals)
     return r_ts, z_vals
+
+
+def main():
+
+
+    #testing get_coarse_query_points
+    N_rays = 5
+    N_samples = 10
+    t_n = 0.5
+    t_f = 2.0
+
+    # Create test input tensors
+    ray_o = torch.zeros((N_rays, 3))  # Origin at (0,0,0) for each ray
+    ray_d = torch.tensor([[1.0, 0.0, 0.0]] * N_rays)  # Rays pointing in x-direction
+
+    # Run function
+    r_ts, z_vals = get_coarse_query_points(ray_o, ray_d, N_samples, t_n, t_f)
+
+    # Check output shapes
+    assert r_ts.shape == (N_rays, N_samples, 3), f"Unexpected shape for r_ts: {r_ts.shape}"
+    assert z_vals.shape == (N_rays, N_samples), f"Unexpected shape for z_vals: {z_vals.shape}"
+
+    # Check depth values are within range
+    assert torch.all(z_vals >= t_n) and torch.all(z_vals <= t_f), "z_vals out of range"
+
+    # Check if points are correctly computed along the ray direction
+    expected_r_ts = ray_o[:, None, :] + ray_d[:, None, :] * z_vals[..., None]
+    assert torch.allclose(r_ts, expected_r_ts, atol=1e-6), "r_ts computation is incorrect"
+
+    print("All tests passed!")
+
+
+if __name__ == "__main__":
+    main()
 

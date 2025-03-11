@@ -61,11 +61,28 @@ class NeRF(nn.Module):
                 h_color = layer(h_color)
                 h_color = F.relu(h_color)
 
-            rgb = torch.sigmoid(self.rgb_linear(h_color))
+            rgb = torch.sigmod(self.rgb_linear(h_color))
             output = torch.cat([rgb, sigma], dim=-1)
             return output
         
             
 
 
+def get_coarse_query_points(ray_o, ray_d, N_samples, t_n, t_f):
+    N_rays = ray_o.shape[0]
+
+    # sampling depths
+    t_vals = torch.linspace(0., 1., steps=N_samples, device=ray_o.device)
+    z_vals = t_n * (1. - t_vals) + t_f * t_vals
+    z_vals = z_vals.expand(N_rays, N_samples)
+
+    #stratified sampling
+    mids = 0.5 * (z_vals[:,1:] + z_vals[:, :-1]) # midpoints between adjacent samples
+    upper = torch.cat([mids, z_vals[:, :-1]], dim=-1) # upper bounds
+    lower = torch.cat([z_vals[:, :1], mids], dim=-1) # lower 
+    t_rand = torch.rand(z_vals.shape, device = ray_o.device) # random numbers so u can sample within the bins
+    z_vals = lower + (upper-lower) * t_rand # sample within each bin using t_Rand
+
+    r_ts = ray_o.unsqueeze(1) + ray_d.unsqueeze(1) * z_vals.unsqueeze(2) # calc using r = o + td formula
+    return r_ts, z_vals
 

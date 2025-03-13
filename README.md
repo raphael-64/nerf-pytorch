@@ -1,3 +1,2 @@
 **Neural Radiance Fields**
-__Neural Radiance Fields__
 Implementation in PyTorch

@@ -4,7 +4,6 @@ import torch
 
 from torch import nn, optim
 
-
 def get_coarse_query_points(ds, N_c, t_i_c_bin_edges, t_i_c_gap, os):
     # Sample depths (t_is_c). See Equation (2) in Section 4.
     u_is_c = torch.rand(*list(ds.shape[:2]) + [N_c]).to(ds) 

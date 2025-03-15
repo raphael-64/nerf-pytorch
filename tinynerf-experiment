@@ -1,0 +1,378 @@
+# Cell 1: Setup and Dependencies
+!pip install torch numpy matplotlib tqdm
+!wget https://raw.githubusercontent.com/bmild/nerf/master/tiny_nerf_data.npz -O 66bdbc812bd0a196e194052f3f12cb2e.npz
+
+# Cell 2: GPU Check and Imports
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from torch import nn, optim
+from tqdm.notebook import tqdm
+from IPython.display import clear_output
+import time
+import os
+
+print(f"GPU available: {torch.cuda.is_available()}")
+print(f"GPU device name: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU'}")
+
+# Cell 3: Main Code
+# Hyperparameters and configuration
+CONFIG = {
+    "pos_encoding_dims": 6,    # L_pos: Number of frequencies for position encoding
+    "dir_encoding_dims": 4,    # L_dir: Number of frequencies for direction encoding
+    "network_width": 256,      # Width of the neural network layers
+    "num_coarse_samples": 32,  # N_c: Number of coarse samples per ray
+    "near_bound": 1.0,        # t_n: Near bound for sampling
+    "far_bound": 4.0,         # t_f: Far bound for sampling
+    "chunk_size": 16384,      # Number of points to process at once (memory management)
+    "learning_rate": 5e-3,
+    "num_iterations": 20000,
+    "display_every": 1000,
+    "save_every": 5000,       # Save checkpoint every N iterations
+    "checkpoint_dir": "checkpoints",
+}
+
+def get_coarse_query_points(ray_directions, num_samples, near_bound, far_bound, ray_origins):
+    """
+    Generate sample points along rays for volume rendering.
+    
+    Args:
+        ray_directions: [..., 3] tensor of ray directions
+        num_samples: number of samples per ray
+        near_bound: nearest sampling distance
+        far_bound: farthest sampling distance
+        ray_origins: [..., 3] tensor of ray origin points
+        
+    Returns:
+        points: [..., num_samples, 3] tensor of 3D sample points
+        t_vals: [..., num_samples] tensor of distance values
+    """
+    # Calculate sampling bin size
+    bin_size = (far_bound - near_bound) / num_samples
+    bin_edges = near_bound + torch.arange(num_samples).to(ray_directions) * bin_size
+    
+    # Random sampling within each bin
+    random_offsets = torch.rand(*list(ray_directions.shape[:2]) + [num_samples]).to(ray_directions)
+    t_vals = bin_edges + random_offsets * bin_size
+    
+    # Calculate 3D points along rays
+    points = ray_origins[..., None, :] + t_vals[..., :, None] * ray_directions[..., None, :]
+    
+    return points, t_vals
+
+def render_radiance_volume(points, ray_directions, chunk_size, nerf_model, t_vals):
+    """
+    Render the radiance field using volume rendering equation.
+    
+    Args:
+        points: [..., num_samples, 3] tensor of sample points
+        ray_directions: [..., 3] tensor of ray directions
+        chunk_size: number of points to process at once
+        nerf_model: neural network model
+        t_vals: [..., num_samples] tensor of distance values
+        
+    Returns:
+        rgb: [..., 3] tensor of rendered RGB values
+    """
+    # Flatten points for batch processing
+    flat_points = points.reshape((-1, 3))
+    repeated_dirs = ray_directions.unsqueeze(2).repeat(1, 1, points.shape[-2], 1)
+    flat_dirs = repeated_dirs.reshape((-1, 3))
+    
+    # Process points in chunks to avoid OOM
+    colors, densities = [], []
+    
+    # Use tqdm for progress bar in chunks
+    num_chunks = (flat_points.shape[0] + chunk_size - 1) // chunk_size
+    for chunk_start in range(0, flat_points.shape[0], chunk_size):
+        chunk_end = min(chunk_start + chunk_size, flat_points.shape[0])
+        points_chunk = flat_points[chunk_start:chunk_end]
+        dirs_chunk = flat_dirs[chunk_start:chunk_end]
+        
+        with torch.set_grad_enabled(nerf_model.training):
+            predictions = nerf_model(points_chunk, dirs_chunk)
+            colors.append(predictions["c_is"])
+            densities.append(predictions["sigma_is"])
+
+    colors = torch.cat(colors).reshape(points.shape)
+    densities = torch.cat(densities).reshape(points.shape[:-1])
+
+    # Calculate transmittance
+    delta_dists = t_vals[..., 1:] - t_vals[..., :-1]
+    infinity_tensor = torch.Tensor([1e10]).expand(delta_dists[..., :1].shape)
+    delta_dists = torch.cat([delta_dists, infinity_tensor.to(delta_dists)], dim=-1)
+    delta_dists = delta_dists * ray_directions.norm(dim=-1).unsqueeze(-1)
+
+    alphas = 1.0 - torch.exp(-densities * delta_dists)
+    transmittance = torch.cumprod(1.0 - alphas + 1e-10, -1)
+    transmittance = torch.roll(transmittance, 1, -1)
+    transmittance[..., 0] = 1.0
+
+    weights = transmittance * alphas
+    rgb = (weights[..., None] * colors).sum(dim=-2)
+    
+    return rgb
+
+def run_one_iter_of_tiny_nerf(ray_directions, num_samples, near_bound, far_bound, ray_origins, chunk_size, nerf_model):
+    """Run one iteration of the tiny NeRF model."""
+    points, t_vals = get_coarse_query_points(ray_directions, num_samples, near_bound, far_bound, ray_origins)
+    rgb = render_radiance_volume(points, ray_directions, chunk_size, nerf_model, t_vals)
+    return rgb
+
+class TinyNeRFMLP(nn.Module):
+    """
+    Neural network for NeRF (Neural Radiance Fields).
+    Takes 3D position and viewing direction as input, outputs RGB color and density.
+    """
+    def __init__(self, pos_encoding_dims=6, dir_encoding_dims=4, network_width=256):
+        super().__init__()
+        self.pos_encoding_dims = pos_encoding_dims
+        self.dir_encoding_dims = dir_encoding_dims
+        
+        # Calculate input feature dimensions after positional encoding
+        pos_enc_feats = 3 + 3 * 2 * pos_encoding_dims
+        dir_enc_feats = 3 + 3 * 2 * dir_encoding_dims
+
+        # MLP architecture
+        self.early_mlp = nn.Sequential(
+            nn.Linear(pos_enc_feats, network_width),
+            nn.ReLU(),
+            nn.Linear(network_width, network_width + 1),
+            nn.ReLU(),
+        )
+        
+        self.late_mlp = nn.Sequential(
+            nn.Linear(network_width + dir_enc_feats, network_width),
+            nn.ReLU(),
+            nn.Linear(network_width, 3),
+            nn.Sigmoid(),
+        )
+
+    def positional_encoding(self, x, num_dims):
+        """Apply positional encoding to input."""
+        encodings = [x]
+        for i in range(num_dims):
+            for fn in [torch.sin, torch.cos]:
+                encodings.append(fn(2.0 ** i * torch.pi * x))
+        return torch.cat(encodings, dim=-1)
+
+    def forward(self, positions, directions):
+        """
+        Forward pass of the network.
+        
+        Args:
+            positions: [..., 3] Points in 3D space
+            directions: [..., 3] Viewing directions
+            
+        Returns:
+            dict containing:
+                c_is: [..., 3] RGB colors
+                sigma_is: [...] Densities
+        """
+        # Normalize viewing directions
+        directions = directions / directions.norm(p=2, dim=-1, keepdim=True)
+        
+        # Apply positional encoding
+        pos_encoded = self.positional_encoding(positions, self.pos_encoding_dims)
+        dir_encoded = self.positional_encoding(directions, self.dir_encoding_dims)
+        
+        # Process through network
+        outputs = self.early_mlp(pos_encoded)
+        sigma = outputs[..., 0]
+        rgb = self.late_mlp(torch.cat([outputs[..., 1:], dir_encoded], dim=-1))
+        
+        return {"c_is": rgb, "sigma_is": sigma}
+
+def save_checkpoint(model, optimizer, iteration, psnrs, iternums, filename):
+    """Save training checkpoint."""
+    os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
+    path = os.path.join(CONFIG["checkpoint_dir"], filename)
+    torch.save({
+        'iteration': iteration,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'psnrs': psnrs,
+        'iternums': iternums,
+    }, path)
+
+def load_checkpoint(model, optimizer, filename):
+    """Load training checkpoint."""
+    path = os.path.join(CONFIG["checkpoint_dir"], filename)
+    if os.path.exists(path):
+        checkpoint = torch.load(path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_iter = checkpoint['iteration']
+        psnrs = checkpoint['psnrs']
+        iternums = checkpoint['iternums']
+        return start_iter, psnrs, iternums
+    return 0, [], []
+
+def main():
+    # Set random seeds for reproducibility
+    seed = 9458
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # Set device and enable optimizations
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        scaler = torch.amp.GradScaler()
+    else:
+        scaler = None
+
+    # Initialize model and optimizer
+    model = TinyNeRFMLP(
+        pos_encoding_dims=CONFIG["pos_encoding_dims"],
+        dir_encoding_dims=CONFIG["dir_encoding_dims"],
+        network_width=CONFIG["network_width"]
+    ).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
+    criterion = nn.MSELoss()
+
+    # Load checkpoint if exists
+    start_iter, psnrs, iternums = load_checkpoint(model, optimizer, "latest.pt")
+    if start_iter > 0:
+        print(f"Resuming from iteration {start_iter}")
+
+    # Load dataset
+    data = np.load("66bdbc812bd0a196e194052f3f12cb2e.npz")
+    images = data["images"] / 255.0  # Normalize to [0, 1]
+    
+    # Setup camera parameters
+    img_size = images.shape[1]
+    focal = float(data["focal"])
+    
+    # Create pixel coordinates
+    xs = torch.arange(img_size) - (img_size / 2 - 0.5)
+    ys = torch.arange(img_size) - (img_size / 2 - 0.5)
+    xs, ys = torch.meshgrid(xs, -ys, indexing="xy")
+    
+    # Create camera rays
+    pixel_coords = torch.stack([xs, ys, torch.full_like(xs, -focal)], dim=-1)
+    camera_coords = pixel_coords / focal
+    
+    # Move to device
+    init_rays = camera_coords.to(device)
+    init_origin = torch.Tensor([0, 0, float(data["camera_distance"])]).to(device)
+
+    # Setup test view
+    test_idx = 150
+    plt.figure(figsize=(6, 6))
+    plt.imshow(images[test_idx])
+    plt.title("Test View Ground Truth")
+    plt.show()
+    
+    test_img = torch.Tensor(images[test_idx]).to(device)
+    test_pose = torch.Tensor(data["poses"][test_idx, :3, :3]).to(device)
+    test_rays = torch.einsum("ij,hwj->hwi", test_pose, init_rays)
+    test_origins = (test_pose @ init_origin).expand(test_rays.shape)
+
+    # Training loop
+    train_indices = np.arange(len(images)) != test_idx
+    train_images = torch.Tensor(images[train_indices])
+    train_poses = torch.Tensor(data["poses"][train_indices])
+    
+    if not psnrs:  # If not loaded from checkpoint
+        psnrs = []
+        iternums = []
+
+    # Create progress bar
+    pbar = tqdm(range(start_iter, CONFIG["num_iterations"]), 
+                desc="Training", 
+                initial=start_iter, 
+                total=CONFIG["num_iterations"])
+    
+    training_start_time = time.time()
+    
+    for i in pbar:
+        # Random training view
+        target_idx = np.random.randint(train_images.shape[0])
+        target_pose = train_poses[target_idx].to(device)
+        target_transform = target_pose[:3, :3]
+        
+        rays = torch.einsum("ij,hwj->hwi", target_transform, init_rays)
+        ray_origins = (target_transform @ init_origin).expand(rays.shape)
+
+        # Render view and compute loss with mixed precision
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                rendered = run_one_iter_of_tiny_nerf(
+                    rays, CONFIG["num_coarse_samples"], CONFIG["near_bound"],
+                    CONFIG["far_bound"], ray_origins, CONFIG["chunk_size"], model
+                )
+                loss = criterion(rendered, train_images[target_idx].to(device))
+            
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            rendered = run_one_iter_of_tiny_nerf(
+                rays, CONFIG["num_coarse_samples"], CONFIG["near_bound"],
+                CONFIG["far_bound"], ray_origins, CONFIG["chunk_size"], model
+            )
+            loss = criterion(rendered, train_images[target_idx].to(device))
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'time/iter': f'{(time.time() - training_start_time)/(i+1-start_iter):.2f}s'
+        })
+
+        # Logging and visualization
+        if i % CONFIG["display_every"] == 0:
+            model.eval()
+            with torch.no_grad():
+                test_render = run_one_iter_of_tiny_nerf(
+                    test_rays, CONFIG["num_coarse_samples"], CONFIG["near_bound"],
+                    CONFIG["far_bound"], test_origins, CONFIG["chunk_size"], model
+                )
+
+            test_loss = criterion(test_render, test_img)
+            psnr = -10.0 * torch.log10(test_loss)
+            
+            psnrs.append(psnr.item())
+            iternums.append(i)
+            
+            # Visualization
+            clear_output(wait=True)
+            plt.figure(figsize=(15, 5))
+            
+            plt.subplot(131)
+            plt.imshow(test_img.cpu().numpy())
+            plt.title("Ground Truth")
+            
+            plt.subplot(132)
+            plt.imshow(test_render.detach().cpu().numpy())
+            plt.title(f"Rendered (Iter {i})")
+            
+            plt.subplot(133)
+            plt.plot(iternums, psnrs)
+            plt.title(f"PSNR (Current: {psnr.item():.2f})")
+            plt.xlabel("Iteration")
+            plt.ylabel("PSNR")
+            
+            plt.tight_layout()
+            plt.show()
+            
+            model.train()
+        
+        # Save checkpoint
+        if i % CONFIG["save_every"] == 0:
+            save_checkpoint(model, optimizer, i, psnrs, iternums, "latest.pt")
+
+    # Final save
+    save_checkpoint(model, optimizer, CONFIG["num_iterations"], psnrs, iternums, "final.pt")
+    print("Training complete!")
+
+if __name__ == "__main__":
+    main()

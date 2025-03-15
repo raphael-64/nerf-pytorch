@@ -7,10 +7,13 @@ from torch import nn, optim
 
 def get_coarse_query_points(ds, N_c, t_i_c_bin_edges, t_i_c_gap, os):
     # Sample depths (t_is_c). See Equation (2) in Section 4.
-    u_is_c = torch.rand(*list(ds.shape[:2]) + [N_c]).to(ds)
+    u_is_c = torch.rand(*list(ds.shape[:2]) + [N_c]).to(ds) 
+    # random numbers generated in the shape of list?? and *list(ds.shape[:2]) just makes this shit like 2,3 instead of [2,3] so we can use as separate parameters
     t_is_c = t_i_c_bin_edges + u_is_c * t_i_c_gap
+    # this is just like start + random * gap this shit jjsut makes sense
     # Calculate the points along the rays (r_ts_c) using the ray origins (os), sampled
     # depths (t_is_c), and ray directions (ds). See Section 4: r(t) = o + t * d.
+    # this shit just ray formula, origins + directions * t_Vals (how far up the direction this shit at, and thats random)
     r_ts_c = os[..., None, :] + t_is_c[..., :, None] * ds[..., None, :]
     return (r_ts_c, t_is_c)
 
@@ -20,10 +23,15 @@ def get_fine_query_points(w_is_c, N_f, t_is_c, t_f, os, ds):
     # https://stephens999.github.io/fiveMinuteStats/inverse_transform_sampling.html#discrete_distributions.
 
     # Define PDFs (pdfs) and CDFs (cdfs) from weights (w_is_c).
+
     w_is_c = w_is_c + 1e-5
-    pdfs = w_is_c / torch.sum(w_is_c, dim=-1, keepdim=True)
+    # so this shit doesnt divice by 0
+    pdfs = w_is_c / torch.sum(w_is_c, dim=-1, keepdim=True) #torch.sum() is so useful oml!!
+    # this shit is just so that we get a probability function pdfs rather than just a function ykwim?? so for every value in the list is now just proabbility of that occuring 
     cdfs = torch.cumsum(pdfs, dim=-1)
+    # cdf u can just use a method called cumsum!!
     cdfs = torch.cat([torch.zeros_like(cdfs[..., :1]), cdfs[..., :-1]], dim=-1)
+    # torch.cat() concatenates two tensors along a specified dimension. since it's -1
 
     # Get uniform samples (us).
     us = torch.rand(list(cdfs.shape[:-1]) + [N_f]).to(w_is_c)
@@ -127,7 +135,7 @@ class NeRFMLP(nn.Module):
         dir_enc_feats = 3 + 3 * 2 * self.L_dir
 
         in_feats = pos_enc_feats
-        net_width = 256
+        net_width = 128 # 256
         early_mlp_layers = 5
         early_mlp = []
         for layer_idx in range(early_mlp_layers):
@@ -188,28 +196,31 @@ def main():
     np.random.seed(seed)
 
     # Initialize coarse and fine MLPs.
-    device = "cuda:0"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f'device is {device}')
     F_c = NeRFMLP().to(device)
     F_f = NeRFMLP().to(device)
     # Number of query points passed through the MLP at a time. See: https://github.com/bmild/nerf/blob/18b8aebda6700ed659cb27a0c348b737a5f6ab60/run_nerf.py#L488.
     chunk_size = 1024 * 32
+
+
     # Number of training rays per iteration. See Section 5.3.
-    batch_img_size = 64
+    batch_img_size = 32 # 64
     n_batch_pix = batch_img_size**2
 
     # Initialize optimizer. See Section 5.3.
-    lr = 5e-4
+    lr = 1e-3 #5e-4
     optimizer = optim.Adam(list(F_c.parameters()) + list(F_f.parameters()), lr=lr)
     criterion = nn.MSELoss()
     # The learning rate decays exponentially. See Section 5.3
     # See: https://github.com/bmild/nerf/blob/18b8aebda6700ed659cb27a0c348b737a5f6ab60/run_nerf.py#L486.
-    lrate_decay = 250
+    lrate_decay = 100 # 250
     decay_steps = lrate_decay * 1000
     # See: https://github.com/bmild/nerf/blob/18b8aebda6700ed659cb27a0c348b737a5f6ab60/run_nerf.py#L707.
     decay_rate = 0.1
 
     # Load dataset.
-    data_f = "66bdbc812bd0a196e194052f3f12cb2e.npz"
+    data_f = "data.npz"
     data = np.load(data_f)
 
     # Set up initial ray origin (init_o) and ray directions (init_ds). These are the
@@ -244,9 +255,9 @@ def main():
     # Far bound. See Section 4.
     t_f = 4.0
     # Number of coarse samples along a ray. See Section 5.3.
-    N_c = 64
+    N_c = 32 # 64
     # Number of fine samples along a ray. See Section 5.3.
-    N_f = 128
+    N_f = 64 # 128
     # Bins used to sample depths along a ray. See Equation (2) in Section 4.
     t_i_c_gap = (t_f - t_n) / N_c
     t_i_c_bin_edges = (t_n + torch.arange(N_c) * t_i_c_gap).to(device)
@@ -260,8 +271,8 @@ def main():
     psnrs = []
     iternums = []
     # See Section 5.3.
-    num_iters = 300000
-    display_every = 100
+    num_iters = 300 # 
+    display_every = 1 # show iters
     F_c.train()
     F_f.train()
     for i in range(num_iters):

@@ -114,7 +114,7 @@ def main():
     optimizer = optim.Adam(F_c.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    data_f = "66bdbc812bd0a196e194052f3f12cb2e.npz"
+    data_f = "data.npz"
     data = np.load(data_f)
 
     images = data["images"] / 255

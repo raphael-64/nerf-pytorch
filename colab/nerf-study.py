@@ -98,14 +98,36 @@ class NeRFMLP(nn.Module):
         rgb_features = self.pre_final_layer(torch.cat([dir_encoded, outputs[...,1:]], dim=-1))
         rgb = self.final_layer(rgb_features)
 
-        return {"c_is": rgb, "sigma_is": sigma}
+        return {"rgb": rgb, "sigma": sigma}
     
 def get_coarse_query_points(num_samples, ray_directions, ray_origins, near_bound, far_bound):
-    # bin_size = (far_bound-near_bound) / num_samples
-    # bin_edges = near_bound + torch.arange(num_samples, device=ray_directions.device) * bin_size
-    bin_edges = torch.linspace(near_bound, far_bound, num_samples)
+    bin_size = (far_bound-near_bound) / num_samples
+    bin_edges = near_bound + torch.arange(num_samples, device=ray_directions.device) * bin_size
+    # bin_edges = torch.linspace(near_bound, far_bound, num_samples)
 
     random_offsets = torch.rand(*ray_directions.shape[:-1], num_samples, device=ray_directions.device)
+    t_vals = bin_edges + random_offsets * bin_size
+
+    points = ray_origins[] + ray_directions[] * t_vals[]
+
+    return points, t_vals
+
+def get_fine_query_points(num_fine_samples, ray_origins, ray_directions, far_bound, weights, coarse_t_vals):
+    weights = weights + 1e-4
+    pdf = weights / weights.sum(dim=-1, keepdim=True)
+    cdf = torch.cumsum(pdf, dim=-1)
+    cdf = torch.cat(torch.zeros_like(cdf[...,:1]), cdf[...,:-1], dim=-1)
+
+    uniform_samples = torch.rand(*weights.shape[:-1], num_fine_samples, device=weights.device)
+
+    indices - torch.searchsorted(cdf, uniform_samples, right=True)
+    below = torch.max(torch.zeros_like(indices), indices-1)
+
+
+
+
+
+
  
 
 

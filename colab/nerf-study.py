@@ -120,15 +120,13 @@ def get_fine_query_points(num_fine_samples, ray_origins, ray_directions, far_bou
 
     uniform_samples = torch.rand(*weights.shape[:-1], num_fine_samples, device=weights.device)
 
+    # this just takes all the sorted uniform samples and searches for the cdf?? 
+    # alternaitvely it takes the cdf and finds the uniform_samples within it, returning the indices.
     indices - torch.searchsorted(cdf, uniform_samples, right=True)
+    # 
     below = torch.max(torch.zeros_like(indices), indices-1)
 
 
-
-
-
-
- 
 
 
 

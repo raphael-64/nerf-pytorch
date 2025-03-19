@@ -14,7 +14,6 @@ Derived from methodology outlined in the NeRF paper (Mildenhall et al., 2020) [h
 
 ## Training
 
-- Training takes ~2-3 hours on Colab GPU
 - Progress visualizations every 2000 iterations
 - Checkpoints saved every 10000 iterations
 - Default test view: 150th image

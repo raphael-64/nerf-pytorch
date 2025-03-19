@@ -262,11 +262,11 @@ def train_nerf():
     torch.manual_seed(9458)
     np.random.seed(9458)
 
-    device = CONFIG["device"]
+    device = config.device
 
     # Initialize models
-    coarse_model = NeRFMLP(CONFIG).to(device)
-    fine_model = NeRFMLP(CONFIG).to(device)
+    coarse_model = NeRFMLP().to(device)
+    fine_model = NeRFMLP().to(device)
 
     if device == "cuda":
         # Enable TF32 for better performance
@@ -279,17 +279,17 @@ def train_nerf():
     # Initialize optimizer
     optimizer = optim.Adam(
         list(coarse_model.parameters()) + list(fine_model.parameters()),
-        lr=CONFIG["learning_rate"]
+        lr=config.learning_rate
     )
     criterion = nn.MSELoss()
 
     # Load checkpoint if exists
-    start_iter, psnrs = load_checkpoint(coarse_model, fine_model, optimizer, CONFIG)
+    start_iter, psnrs = load_checkpoint(coarse_model, fine_model, optimizer, config)
     if start_iter > 0:
         print(f"Resuming from iteration {start_iter}")
 
     # Load dataset
-    data = np.load(CONFIG["data_path"])
+    data = np.load(config.data_path)
     images = torch.from_numpy(data["images"]).float() / 255.0
     poses = torch.from_numpy(data["poses"]).float()
     focal = float(data["focal"])
@@ -307,7 +307,7 @@ def train_nerf():
     init_origin = torch.tensor([0, 0, float(data["camera_distance"])], device=device)
 
     # Setup test view
-    test_idx = CONFIG["test_view_idx"]
+    test_idx = config.test_view_idx
     plt.figure(figsize=(6, 6))
     plt.imshow(images[test_idx])
     plt.title("Test View Ground Truth")
@@ -332,7 +332,7 @@ def train_nerf():
         target_pose = train_poses[target_idx, :3, :3]
 
         # Random patch of rays
-        batch_size = CONFIG["batch_size"]
+        batch_size = config.batch_size
         patch_x = np.random.randint(0, img_size - batch_size + 1)
         patch_y = np.random.randint(0, img_size - batch_size + 1)
         patch_rays = init_rays[patch_y:patch_y+batch_size, patch_x:patch_x+batch_size]
@@ -344,9 +344,9 @@ def train_nerf():
 
         # Render and compute loss
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast("cuda"):
                 coarse_rgb, fine_rgb = run_one_iter_of_nerf(
-                    rays, ray_origins, CONFIG, coarse_model, fine_model
+                    rays, ray_origins, config, coarse_model, fine_model
                 )
                 loss = criterion(coarse_rgb, patch_target) + criterion(fine_rgb, patch_target)
 
@@ -356,7 +356,7 @@ def train_nerf():
             scaler.update()
         else:
             coarse_rgb, fine_rgb = run_one_iter_of_nerf(
-                rays, ray_origins, CONFIG, coarse_model, fine_model
+                rays, ray_origins, config, coarse_model, fine_model
             )
             loss = criterion(coarse_rgb, patch_target) + criterion(fine_rgb, patch_target)
 
@@ -365,7 +365,7 @@ def train_nerf():
             optimizer.step()
 
         # Learning rate decay
-        new_lr = CONFIG["learning_rate"] * (CONFIG["lr_decay_rate"] ** (i / CONFIG["lr_decay_steps"]))
+        new_lr = config.learning_rate * (config.lr_decay_rate ** (i / config.lr_decay_steps))
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lr
 
@@ -422,47 +422,9 @@ def train_nerf():
         if i % CONFIG["save_every"] == 0:
             save_checkpoint(coarse_model, fine_model, optimizer, i, psnrs, CONFIG)
 
+if __name__ == "__main__":
+    train_nerf()
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    indices = torch.searchsorted(cdfs, uniform_samples, right=True)
-    below = torch.max(torch.zeros_like(indices), indices-1)
-    above = torch.min((coarse_t_vals.shape[-1]-1) * torch.ones_like(indices), indices)
-    t_below = torch.gather(coarse_t_vals, -1, below)
-    t_above = torch.gather(coarse_t_vals, -1, above)
-    t_above[indices == coarse_t_vals.shape[-1]] = far_bound
-
-    t_vals_fine = t_below + (t_above - t_below) * torch.rand_like(t_below)
-
-    # Combine and sort all samples
-    t_vals_all, _ = torch.sort(torch.cat([coarse_t_vals, t_vals_fine], dim=-1), dim=-1)
-    points = ray_origins[..., None, :] + t_vals_all[..., :, None] * ray_directions[..., None, :]
-
-    return points, t_vals_all
-
-
-
-
- 
 
 
 
